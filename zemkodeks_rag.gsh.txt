@@ -1,0 +1,485 @@
+// --- DEPENDENCY (run once per session) ---
+groovy.grape.Grape.grab([group:"org.postgresql", artifact:"postgresql", version:"42.7.3"])
+Class.forName("org.postgresql.Driver")
+
+import groovy.json.JsonOutput
+import groovy.json.JsonSlurper
+import java.sql.DriverManager
+
+// --- CONFIG ---
+FILE_PATH = "/Users/mvmn/Downloads/zemkodeks.txt"
+DB_URL = "jdbc:postgresql://localhost:5432/postgres"
+DB_USER = "postgres"
+DB_PASS = "postgres"
+
+EMBEDDING_URL = "http://localhost:54321/v1/embeddings"
+
+// --- LOAD + CLEAN TEXT ---
+text = new File(FILE_PATH).getText("UTF-8")
+
+// REMOVE {...} blocks
+text = text.replaceAll("\\{[^\\}]+\\}", "")
+text = text.replaceAll("\n\n+", "\n\n")
+
+// --- SPLIT INTO LINES ---
+lines = text.readLines()
+
+// --- PATTERNS ---
+sectionPattern = ~/^Розділ\s+.+/
+chapterPattern = ~/^Глава\s+.+/
+articlePattern = ~/^Стаття\s+([\d\-]+).*/
+pointPattern = ~/^(\d+)\.\s*(.*)/
+
+// list items (article-level AND nested)
+subPointPattern = ~/^\s*([а-яіїєґa-zA-Z0-9]+)\)\s*(.*)/
+
+// header (text ending with ":")
+headerPattern = ~/^(?!\d+\.).+:\s*$/
+
+// --- STATE ---
+currentSection = ""
+currentChapter = ""
+currentArticleNum = ""
+currentArticleTitle = ""
+
+currentPoint = ""
+currentSubPoint = ""
+
+currentHeader = ""
+
+startedArticles = false
+
+chunks = []
+currentChunk = null
+
+ord = 0
+stopParsing = false
+
+// --- HELPERS ---
+
+flushChunk = {
+    if (currentChunk != null) {
+        chunks << currentChunk
+        currentChunk = null
+    }
+}
+
+startChunk = { chunkId, firstLine ->
+    ord++
+
+    currentChunk = [
+        article : currentArticleNum,
+        chunk_id: chunkId,
+        ord     : ord,
+        text    : new StringBuilder()
+    ]
+
+    if (currentSection) currentChunk.text.append(currentSection).append("\n")
+    if (currentChapter) currentChunk.text.append(currentChapter).append("\n")
+    currentChunk.text.append(currentArticleTitle).append("\n")
+
+    if (currentHeader) currentChunk.text.append(currentHeader).append("\n")
+
+    if (firstLine) {
+        currentChunk.text.append(firstLine).append("\n")
+    }
+}
+
+// --- PARSE ---
+
+lines.each { rawLine ->
+    if (stopParsing) return
+
+    line = rawLine.trim()
+    if (!line) return
+
+    // --- STOP ---
+    if (startedArticles && line.contains("ПРИКІНЦЕВІ ПОЛОЖЕННЯ")) {
+        stopParsing = true
+        flushChunk()
+        return
+    }
+
+    // --- SECTION ---
+    if (line ==~ sectionPattern) {
+        flushChunk()
+        currentSection = line
+        currentChapter = ""
+        currentHeader = ""
+        return
+    }
+
+    // --- CHAPTER ---
+    if (line ==~ chapterPattern) {
+        flushChunk()
+        currentChapter = line
+        currentHeader = ""
+        return
+    }
+
+    // --- ARTICLE ---
+    def articleMatcher = (line =~ articlePattern)
+    if (articleMatcher.matches()) {
+
+        startedArticles = true
+
+        flushChunk()
+
+        currentArticleNum = articleMatcher[0][1]
+        currentArticleTitle = line
+
+        currentPoint = ""
+        currentSubPoint = ""
+        currentHeader = ""
+
+        return
+    }
+
+    // --- POINT (1., 2., etc.) ---
+    def pointMatcher = (line =~ pointPattern)
+    if (pointMatcher.matches()) {
+
+        flushChunk()
+
+        currentPoint = pointMatcher[0][1]
+        currentSubPoint = ""
+
+        startChunk("${currentArticleNum}.${currentPoint}", line)
+
+        return
+    }
+
+    // --- SUBPOINT (а), б), etc.) ---
+    def subMatcher = (line =~ subPointPattern)
+
+    if (subMatcher.matches()) {
+
+        flushChunk()
+
+        def subId = subMatcher[0][1]
+
+        // 🔥 KEY FIX:
+        // do NOT require currentPoint
+        def chunkId
+
+        if (currentPoint) {
+            chunkId = "${currentArticleNum}.${currentPoint}.${subId}"
+        } else {
+            // Article-level list (Article 5 case)
+            chunkId = "${currentArticleNum}.${subId}"
+        }
+
+        startChunk(chunkId, line)
+
+        return
+    }
+
+    // --- HEADER ---
+    if (line ==~ headerPattern) {
+        if (currentChunk != null) {
+            currentHeader = line
+        } else if (startedArticles) {
+            // never lose text
+            startChunk("${currentArticleNum}.x", line)
+        }
+        return
+    }
+
+    // --- GUARANTEE CHUNK EXISTS ---
+    if (currentChunk == null && startedArticles) {
+        startChunk("${currentArticleNum}.x", "")
+    }
+
+    // --- CONTINUE CURRENT CHUNK ---
+    if (currentChunk != null) {
+        currentChunk.text.append(line).append("\n")
+    }
+}
+
+// --- FINAL FLUSH ---
+flushChunk()
+
+// --- FINALIZE ---
+chunks.each {
+    it.text = it.text.toString().trim()
+}
+
+println "Parsed ${chunks.size()} chunks"
+
+driver = new org.postgresql.Driver()
+conn = driver.connect(DB_URL, [ user: DB_USER,    password: DB_PASS ] as java.util.Properties)
+
+// --- EMBEDDING FUNCTION ---
+getEmbedding = { inputText ->
+    connHttp = new URL(EMBEDDING_URL).openConnection()
+    connHttp.setRequestMethod("POST")
+    connHttp.setDoOutput(true)
+    connHttp.setRequestProperty("Content-Type", "application/json")
+
+    payload = [
+        input: [inputText],
+        model: "text-embedding-qwen3-embedding-4b",
+        encoding_format: "float"
+    ]
+
+    connHttp.outputStream.withWriter("UTF-8") {
+        it << JsonOutput.toJson(payload)
+    }
+
+    response = connHttp.inputStream.text
+    json = new JsonSlurper().parseText(response)
+
+    json.data[0].embedding
+}
+
+insertSql = "INSERT INTO embeddings_refined (article, chunk_id, ord, text, embedding) VALUES (?, ?, ?, ?, ?::vector)"
+ps = conn.prepareStatement(insertSql)
+
+chunks.eachWithIndex { chunk, idx ->
+    println "Processing chunk ${idx + 1} (${chunk.chunk_id})"
+
+    embedding = getEmbedding(chunk.text)
+
+    vectorLiteral = "[" + embedding.join(",") + "]"
+
+    ps.setString(1, chunk.article)
+    ps.setString(2, chunk.chunk_id)
+    ps.setInt(3, chunk.ord)
+    ps.setString(4, chunk.text)
+    ps.setString(5, vectorLiteral)
+
+    ps.executeUpdate()
+}
+
+// --- CLEANUP ---
+ps.close()
+conn.close()
+
+println "Done!"
+
+
+query = { queryText, maxResults, maxDistance, table ->
+
+// --- GET EMBEDDING ---
+queryEmbedding = getEmbedding(queryText)
+
+// --- CONVERT TO pgvector string ---
+vectorString = "[" + queryEmbedding.join(",") + "]"
+
+// --- QUERY ---
+sql = { tableName -> """
+WITH distances AS (
+    SELECT
+        id,
+        text,
+        embedding <-> ?::vector AS distance
+    FROM """ + tableName + """
+    ORDER BY distance
+    LIMIT ?
+)
+SELECT *
+FROM distances
+WHERE distance <= ?
+ORDER BY distance
+"""
+}
+
+ps = conn.prepareStatement(sql(table))
+ps.setString(1, vectorString)
+ps.setInt(2, maxResults)
+ps.setDouble(3, maxDistance)
+
+rs = ps.executeQuery()
+
+results = []
+while (rs.next()) {
+    results.add([id:rs.getLong('id'), distance: rs.getDouble('distance'), text: rs.getString('text')])
+}
+
+rs.close()
+ps.close()
+
+return results;
+}
+
+
+////// Embeddings search
+conn = driver.connect(DB_URL, [ user: DB_USER,    password: DB_PASS ] as java.util.Properties)
+query("отримання нерухомості у спадок", 100, 3, "embeddings_refined").join("\n\n")
+conn.close();
+
+
+
+////// RAG prompting
+rag = {queryText, maxResults, maxDistance, model, expandToArticle = false -> 
+
+// --- EMBEDDING ---
+queryEmbedding = getEmbedding(queryText)
+vectorString = "[" + queryEmbedding.join(",") + "]"
+
+// --- RETRIEVE RELEVANT CHUNKS ---
+searchSql = """
+WITH distances AS (
+    SELECT
+        article,
+        chunk_id,
+        ord,
+        text,
+        embedding <-> ?::vector AS distance
+    FROM embeddings_refined
+)
+SELECT *
+FROM distances
+WHERE distance <= ?
+ORDER BY distance
+LIMIT ?
+"""
+
+driver = new org.postgresql.Driver()
+conn = driver.connect(DB_URL, [ user: DB_USER,    password: DB_PASS ] as java.util.Properties)
+
+ps = conn.prepareStatement(searchSql)
+ps.setString(1, vectorString)
+ps.setDouble(2, maxDistance)
+ps.setInt(3, maxResults)
+
+rs = ps.executeQuery()
+
+results = []
+while (rs.next()) {
+    results << [
+        article : rs.getString("article"),
+        chunk_id: rs.getString("chunk_id"),
+        ord     : rs.getInt("ord"),
+        text    : rs.getString("text"),
+        distance: rs.getDouble("distance")
+    ]
+}
+
+rs.close()
+ps.close()
+
+contextParts = []
+if (expandToArticle) {
+    // get unique articles
+    articleIds = results.collect { it.article }.unique()
+
+    articleSql = """
+    SELECT article, chunk_id, ord, text
+    FROM embeddings_refined
+    WHERE article = ANY (?)
+    ORDER BY article, ord
+    """
+
+    ps2 = conn.prepareStatement(articleSql)
+    sqlArray = conn.createArrayOf("varchar", articleIds as String[])
+    ps2.setArray(1, sqlArray)
+
+    rs2 = ps2.executeQuery()
+    
+    currentArticle = null
+    buffer = new StringBuilder()
+
+    while (rs2.next()) {
+        art = rs2.getString("article")
+
+        if (currentArticle != null && art != currentArticle) {
+            contextParts << buffer.toString().trim()
+            buffer = new StringBuilder()
+        }
+
+        currentArticle = art
+        contextParts << rs2.getString("text");
+    }
+
+    rs2.close()
+    ps2.close()
+
+} else {
+    // just top chunks
+    results.each {
+        contextParts << """[${it.chunk_id}]
+${it.text}"""
+    }
+}
+
+seenArticles = new HashSet()
+
+contextParts = contextParts.collect { chunk ->
+    lines = chunk.readLines()
+
+    if (lines.size() < 3) return chunk
+
+    header = lines[0..2].join("\n")   // Розділ / Глава / Стаття
+    articleKey = lines[2]             // Стаття ...
+
+    if (seenArticles.contains(articleKey)) {
+        // remove header for subsequent chunks
+        return lines.drop(3).join("\n").trim()
+    } else {
+        seenArticles.add(articleKey)
+        return chunk.trim()
+    }
+}
+
+context = contextParts.join("\n\n")
+
+// --- BUILD RAG PROMPT ---
+ragPrompt = """
+Ти є юридичним асистентом. Відповідай тільки на основі наданого контексту з Земельного кодексу України.
+
+Контекст:
+\"\"\"
+${context}
+\"\"\"
+
+
+Питання:
+${queryText}
+
+
+Інструкції:
+- Дай чітку відповідь.
+- Обов'язково вкажи статтю та пункт (churank_id).
+- Не вигадуй інформацію поза контекстом.
+- Дай розгорнуту відповідь щодо суті статті та пункту.
+- Якщо контекст порожній, не давай відповіді, а скажи, що інформація відсутня.
+"""
+
+println "---------\n### RAG prompt:\n"+ragPrompt;
+println "\n\n---------\n\n";
+
+// --- CALL LLM (OpenAI-compatible) ---
+chatUrl = "http://localhost:54321/v1/chat/completions"
+
+connHttp = new URL(chatUrl).openConnection()
+connHttp.setRequestMethod("POST")
+connHttp.setDoOutput(true)
+connHttp.setRequestProperty("Content-Type", "application/json")
+
+payload = [
+    model: model,
+    messages: [
+        [role: "system", content: "Ти юридичний асистент, який відповідає на основі законодавства України."],
+        [role: "user", content: ragPrompt]
+    ],
+    temperature: 0.2
+]
+
+connHttp.outputStream.withWriter("UTF-8") {
+    it << groovy.json.JsonOutput.toJson(payload)
+}
+
+response = connHttp.inputStream.text
+json = new groovy.json.JsonSlurper().parseText(response)
+
+// --- OUTPUT ---
+answer = json.choices[0].message.content
+
+return answer
+}
+
+
+rag("Чи може держава набути право власності на землю через спадщину?", 15, 0.7, "meta/llama-3.3-70b", true)
+
+rag("Які підстави набуття права власності на землю державою?", 15, 0.7, "meta/llama-3.3-70b", false)
