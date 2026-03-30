@@ -24,16 +24,18 @@ text = text.replaceAll("\n\n+", "\n\n")
 // --- SPLIT INTO LINES ---
 lines = text.readLines()
 
+
+
 // --- PATTERNS ---
 sectionPattern = ~/^Розділ\s+.+/
 chapterPattern = ~/^Глава\s+.+/
 articlePattern = ~/^Стаття\s+([\d\-]+).*/
 pointPattern = ~/^(\d+)\.\s*(.*)/
 
-// list items (article-level AND nested)
-subPointPattern = ~/^\s*([а-яіїєґa-zA-Z0-9]+)\)\s*(.*)/
+// subpoint (а), б), etc.)
+subPointPattern = ~/^\s*([а-яіїєґa-zA-Z0-9]+(?:-\d+)?)\)\s*(.*)/
 
-// header (text ending with ":")
+// header (line ending with :)
 headerPattern = ~/^(?!\d+\.).+:\s*$/
 
 // --- STATE ---
@@ -64,7 +66,9 @@ flushChunk = {
     }
 }
 
-startChunk = { chunkId, firstLine ->
+// 🔥 FIX: header is SNAPSHOT, not live variable
+startChunk = { chunkId, firstLine, headerSnapshot ->
+
     ord++
 
     currentChunk = [
@@ -76,18 +80,27 @@ startChunk = { chunkId, firstLine ->
 
     if (currentSection) currentChunk.text.append(currentSection).append("\n")
     if (currentChapter) currentChunk.text.append(currentChapter).append("\n")
+
     currentChunk.text.append(currentArticleTitle).append("\n")
 
-    if (currentHeader) currentChunk.text.append(currentHeader).append("\n")
+    // 🔥 Use SNAPSHOT
+    if (headerSnapshot) {
+        currentChunk.text.append(headerSnapshot).append("\n")
+    }
 
     if (firstLine) {
         currentChunk.text.append(firstLine).append("\n")
     }
 }
 
-// --- PARSE ---
+// --- LIST CONTEXT CONTROL ---
+isListLine = { l ->
+    (l ==~ pointPattern) || (l ==~ subPointPattern)
+}
 
+// --- PARSE ---
 lines.each { rawLine ->
+
     if (stopParsing) return
 
     line = rawLine.trim()
@@ -105,7 +118,7 @@ lines.each { rawLine ->
         flushChunk()
         currentSection = line
         currentChapter = ""
-        currentHeader = ""
+        currentHeader = ""   // reset
         return
     }
 
@@ -113,16 +126,14 @@ lines.each { rawLine ->
     if (line ==~ chapterPattern) {
         flushChunk()
         currentChapter = line
-        currentHeader = ""
+        currentHeader = ""   // reset
         return
     }
 
     // --- ARTICLE ---
-    def articleMatcher = (line =~ articlePattern)
+    articleMatcher = (line =~ articlePattern)
     if (articleMatcher.matches()) {
-
         startedArticles = true
-
         flushChunk()
 
         currentArticleNum = articleMatcher[0][1]
@@ -130,67 +141,63 @@ lines.each { rawLine ->
 
         currentPoint = ""
         currentSubPoint = ""
-        currentHeader = ""
 
-        return
-    }
-
-    // --- POINT (1., 2., etc.) ---
-    def pointMatcher = (line =~ pointPattern)
-    if (pointMatcher.matches()) {
-
-        flushChunk()
-
-        currentPoint = pointMatcher[0][1]
-        currentSubPoint = ""
-
-        startChunk("${currentArticleNum}.${currentPoint}", line)
-
-        return
-    }
-
-    // --- SUBPOINT (а), б), etc.) ---
-    def subMatcher = (line =~ subPointPattern)
-
-    if (subMatcher.matches()) {
-
-        flushChunk()
-
-        def subId = subMatcher[0][1]
-
-        // 🔥 KEY FIX:
-        // do NOT require currentPoint
-        def chunkId
-
-        if (currentPoint) {
-            chunkId = "${currentArticleNum}.${currentPoint}.${subId}"
-        } else {
-            // Article-level list (Article 5 case)
-            chunkId = "${currentArticleNum}.${subId}"
-        }
-
-        startChunk(chunkId, line)
-
+        currentHeader = ""   // reset at article boundary
         return
     }
 
     // --- HEADER ---
     if (line ==~ headerPattern) {
-        if (currentChunk != null) {
+        if (startedArticles) {
             currentHeader = line
-        } else if (startedArticles) {
-            // never lose text
-            startChunk("${currentArticleNum}.x", line)
         }
         return
     }
 
-    // --- GUARANTEE CHUNK EXISTS ---
-    if (currentChunk == null && startedArticles) {
-        startChunk("${currentArticleNum}.x", "")
+    // --- POINT ---
+    pointMatcher = (line =~ pointPattern)
+    if (pointMatcher.matches()) {
+
+        flushChunk()
+
+        currentPoint = pointMatcher[0][1]
+
+        headerSnapshot = currentHeader   // 🔥 SNAPSHOT
+
+        startChunk("${currentArticleNum}.${currentPoint}", line, headerSnapshot)
+
+        return
     }
 
-    // --- CONTINUE CURRENT CHUNK ---
+    // --- SUBPOINT ---
+    subMatcher = (line =~ subPointPattern)
+    if (subMatcher.matches()) {
+
+        flushChunk()
+
+        subId = subMatcher[0][1]
+
+        chunkId = currentPoint ? "${currentArticleNum}.${currentPoint}.${subId}" : "${currentArticleNum}.${subId}"
+
+        headerSnapshot = currentHeader   // 🔥 SNAPSHOT
+
+        startChunk(chunkId, line, headerSnapshot)
+
+        return
+    }
+
+    // --- HEADER RESET LOGIC (SAFE) ---
+    // 🔥 IMPORTANT: do NOT clear header before chunk uses it
+    if (!isListLine(line)) {
+        currentHeader = ""
+    }
+
+    // --- ENSURE CHUNK EXISTS ---
+    if (currentChunk == null && startedArticles) {
+        startChunk("${currentArticleNum}.x", "", null)
+    }
+
+    // --- APPEND TEXT ---
     if (currentChunk != null) {
         currentChunk.text.append(line).append("\n")
     }
@@ -205,6 +212,7 @@ chunks.each {
 }
 
 println "Parsed ${chunks.size()} chunks"
+
 
 driver = new org.postgresql.Driver()
 conn = driver.connect(DB_URL, [ user: DB_USER,    password: DB_PASS ] as java.util.Properties)
