@@ -1,8 +1,10 @@
 Code for simple RAG demo
 
-DB table creation script:
+DB init script:
 
 ```
+CREATE EXTENSION vector;
+
 CREATE TABLE public.embeddings_refined (
 	id bigserial NOT NULL,
 	article varchar(64) NOT NULL,
